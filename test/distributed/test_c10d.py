@@ -2989,6 +2989,53 @@ class DistributedDataParallelTest(MultiProcessTestCase):
             with self.assertRaisesRegex(RuntimeError, ".* appears not to match strides of the same param in process 0"):
                 m_ddp = DistributedDataParallel(m, device_ids=[dev0], process_group=process_group)
 
+    @requires_gloo()
+    def test_ddp_comm_hook_future_passing(self):
+        """
+        This unit test verifies whether the Future object is passed properly.
+        The callback function creates a Future object and sets a value to it.
+        """
+        class tedt_ddep_comm_hook(nn.Module):
+            def __init__(self):
+                super(tedt_ddep_comm_hook, self).__init__()
+                self.t0 = Task()
+
+            def forward(self, x, rank):
+                return self.t0(x + rank)
+
+        def run_and_verify_grad(model):
+            # Run forward
+            output = model(8, self.rank)
+
+            # # The grads of all parameters should be None at this point.
+            [self.assertIsNone(p.grad) for p in model.parameters()]
+
+            # Run backward
+            output.mean().backward()
+
+            # # # Now locally unused parameter should have grad updated on all ranks.
+            [self.assertIsNotNone(p.grad) for p in model.parameters()]
+            print([p.grad for p in model.parameters()])
+
+        def simple_hook(state, bucket):
+            fut = torch.futures.Future()
+            fut.set_result([torch.ones(4)])
+
+            def fut_then(fut):
+                fut.wait()
+            return fut.then(fut_then)
+
+        store = c10d.FileStore(self.file_name, self.world_size)
+        process_group = c10d.ProcessGroupGloo(store, self.rank, self.world_size)
+
+        # Test on CPU
+        cpu_model = DistributedDataParallel(
+            tedt_ddep_comm_hook().cpu(),
+            process_group=process_group
+        )
+        cpu_model.reducer.register_comm_hook(None, simple_hook)
+        run_and_verify_grad(cpu_model)
+
 
 class ReducerModule(nn.Module):
     def __init__(self):
@@ -3124,6 +3171,42 @@ class ReducerTest(TestCase):
             reducer.prepare_for_backward(output)
             output.backward()
             optimizer.step()
+
+    def test_ddp_comm_hook_register_just_once(self):
+        """
+        DDP communication hook can only be registered once. This test validates whether
+        the error is thrown properly when register_comm_hook is called more than once.
+        """
+        model = self._create_mixed_precision_model()
+        reducer = self._create_reducer_for_models([model], find_unused_parameters=True)
+
+        def dummy_hook(state, bucket):
+            fut = torch.futures.Future()
+            fut.set_result(bucket.get_tensors())
+            return fut.then()
+        reducer.register_comm_hook(None, dummy_hook)
+        try:
+            reducer.register_comm_hook(None, dummy_hook)
+        except Exception as e:
+            if "register_comm_hook can only be called once" in str(e):
+                return
+            else:
+                raise e
+
+    def test_ddp_comm_hook_callable(self):
+        """
+        The Python hook must be callable. This unit test checks whether this condition
+        is properly checked inside reducer.
+        """
+        model = self._create_mixed_precision_model()
+        reducer = self._create_reducer_for_models([model], find_unused_parameters=True)
+        try:
+            reducer.register_comm_hook(state=None, hook=1)
+        except Exception as e:
+            if "comm_hook must be callable" in str(e):
+                return
+            else:
+                raise e
 
 
 class ComputeBucketAssignmentTest(TestCase):
